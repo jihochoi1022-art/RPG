@@ -1,0 +1,13 @@
+{
+  "name": "hajanchan-rpg",
+  "version": "1.0.0",
+  "private": true,
+  "description": "하찮은 RPG 멀티플레이 서버",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
