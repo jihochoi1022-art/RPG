@@ -13,7 +13,12 @@ const TICK_MS = 33;
 const INDEX = fs.existsSync(path.join(__dirname, 'index.html')) ? path.join(__dirname, 'index.html') : path.join(__dirname, 'public', 'index.html');
 const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
-const clients = new Set();
+const ADMIN_PASS = process.env.ADMIN_PASS || ''; // 방장 비밀번호 (Render의 Environment에 ADMIN_PASS로 넣어요)
+const clients = new Set();   // 게임에 들어와 있는 사람
+const waiting = new Set();   // 서버가 닫혀 있을 때 접속한 사람 (게임엔 못 들어가요)
+const banned = new Set();    // 영구 추방된 IP (서버를 다시 시작하면 풀려요)
+const authFails = new Map(); // ip -> { n, t }
+let serverClosed = false;
 let dirty = false;
 
 const server = http.createServer((req, res) => {
@@ -48,7 +53,7 @@ function sendText(c, str) {
 function closeClient(c, code) {
   if (c.closed) return;
   c.closed = true;
-  clients.delete(c);
+  clients.delete(c); waiting.delete(c);
   dirty = true;
   try {
     const p = Buffer.alloc(2); p.writeUInt16BE(code || 1000, 0);
@@ -57,12 +62,67 @@ function closeClient(c, code) {
   setTimeout(() => c.socket.destroy(), 500);
 }
 
+/* ---------- 방장 기능 ---------- */
+function safeEq(a, b) {
+  const ha = crypto.createHash('sha256').update(String(a)).digest();
+  const hb = crypto.createHash('sha256').update(String(b)).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+function adminState(me) {
+  const list = [];
+  for (const c of clients) list.push({ i: c.id, n: String((c.p && c.p.n) || '').slice(0, 12), me: c === me, adm: !!c.admin });
+  return JSON.stringify({ t: 'a', list, closed: serverClosed, bans: banned.size, waiting: waiting.size });
+}
+function pushAdminState() {
+  for (const c of [...clients, ...waiting]) if (c.admin) sendText(c, adminState(c));
+}
+function kick(c, reason, ban) {
+  if (ban) banned.add(c.ip);
+  sendText(c, JSON.stringify({ t: 'kick', reason }));
+  closeClient(c, 4001);
+}
+function doAuth(c, m) {
+  const now = Date.now();
+  const rec = authFails.get(c.ip) || { n: 0, t: now };
+  if (now - rec.t > 10 * 60 * 1000) { rec.n = 0; rec.t = now; }
+  if (rec.n >= 8) { sendText(c, JSON.stringify({ t: 'a', err: 'locked' })); return; }
+  if (!ADMIN_PASS) { sendText(c, JSON.stringify({ t: 'a', err: 'nopass' })); return; }
+  if (!safeEq(String(m.pw || '').slice(0, 200), ADMIN_PASS)) {
+    rec.n++; authFails.set(c.ip, rec);
+    sendText(c, JSON.stringify({ t: 'a', err: 'bad' })); return;
+  }
+  c.admin = true;
+  sendText(c, adminState(c));
+}
+function doAdmin(c, m) {
+  if (!c.admin) return;
+  const cmd = m.cmd;
+  if (cmd === 'kick') {
+    for (const t of clients) if (t.id === m.id && t !== c) { kick(t, m.ban ? 'ban' : 'kick', !!m.ban); break; }
+  } else if (cmd === 'close') {
+    serverClosed = true;
+    for (const t of [...clients]) if (!t.admin) kick(t, 'closed', false);
+  } else if (cmd === 'open') {
+    serverClosed = false;
+    for (const t of [...waiting]) { sendText(t, JSON.stringify({ t: 'opened' })); }
+  } else if (cmd === 'unban') {
+    banned.clear();
+  } else if (cmd === 'say') {
+    const text = String(m.text || '').replace(/\s+/g, ' ').trim().slice(0, 100);
+    if (text) { const msg = JSON.stringify({ t: 'notice', text }); for (const t of clients) sendText(t, msg); }
+  }
+  pushAdminState();
+}
+
 function onMessage(c, text) {
   const now = Date.now();
   if (now - c.t > 1000) { c.t = now; c.n = 0; }
   if (++c.n > 60) return; // 초당 60개 넘으면 무시
   let m;
   try { m = JSON.parse(text); } catch (e) { return; }
+  if (m && m.t === 'auth') { doAuth(c, m); return; }
+  if (m && m.t === 'adm') { doAdmin(c, m); return; }
+  if (c.waiting) return;
   if (!m || m.t !== 'p' || !m.d || typeof m.d !== 'object' || Array.isArray(m.d)) return;
   const next = Object.assign({}, c.p);
   for (const k of Object.keys(m.d)) {
@@ -107,17 +167,20 @@ function parse(c) {
 server.on('upgrade', (req, socket) => {
   const key = req.headers['sec-websocket-key'];
   if (!key || (req.headers.upgrade || '').toLowerCase() !== 'websocket') { socket.destroy(); return; }
-  if (clients.size >= MAX_PLAYERS) { socket.end('HTTP/1.1 503 Service Unavailable\r\n\r\n'); return; }
+  if (clients.size >= MAX_PLAYERS && !serverClosed) { socket.end('HTTP/1.1 503 Service Unavailable\r\n\r\n'); return; }
   const accept = crypto.createHash('sha1').update(key + GUID).digest('base64');
   socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + accept + '\r\n\r\n');
   socket.setNoDelay(true);
-  const c = { socket, id: crypto.randomBytes(5).toString('hex'), p: {}, alive: true, n: 0, t: Date.now(), buf: Buffer.alloc(0), frag: null, closed: false };
+  const xff = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  const c = { socket, ip: xff || socket.remoteAddress || '?', id: crypto.randomBytes(5).toString('hex'), p: {}, alive: true, n: 0, t: Date.now(), buf: Buffer.alloc(0), frag: null, closed: false, admin: false, waiting: false };
+  socket.on('data', (d) => { if (c.closed) return; c.buf = Buffer.concat([c.buf, d]); parse(c); });
+  socket.on('close', () => { c.closed = true; clients.delete(c); waiting.delete(c); dirty = true; });
+  socket.on('error', () => { /* close 이벤트에서 정리돼요 */ });
+  if (banned.has(c.ip)) { sendText(c, JSON.stringify({ t: 'kick', reason: 'ban' })); closeClient(c, 4001); return; }
+  if (serverClosed) { c.waiting = true; waiting.add(c); sendText(c, JSON.stringify({ t: 'closed' })); return; }
   clients.add(c);
   sendText(c, JSON.stringify({ t: 'hi', id: c.id }));
   dirty = true;
-  socket.on('data', (d) => { if (c.closed) return; c.buf = Buffer.concat([c.buf, d]); parse(c); });
-  socket.on('close', () => { c.closed = true; clients.delete(c); dirty = true; });
-  socket.on('error', () => { /* close 이벤트에서 정리돼요 */ });
 });
 
 setInterval(() => {
