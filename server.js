@@ -13,6 +13,7 @@ const TICK_MS = 33;
 const INDEX = fs.existsSync(path.join(__dirname, 'index.html')) ? path.join(__dirname, 'index.html') : path.join(__dirname, 'public', 'index.html');
 const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
+const SUB_PASS = process.env.SUB_PASS || ''; // 부관리자 비밀번호 (추방/영구 추방만 가능, Render Environment에 SUB_PASS로 넣어요)
 const ADMIN_PASS = process.env.ADMIN_PASS || ''; // 방장 비밀번호 (Render의 Environment에 ADMIN_PASS로 넣어요)
 const clients = new Set();   // 게임에 들어와 있는 사람
 const waiting = new Set();   // 서버가 닫혀 있을 때 접속한 사람 (게임엔 못 들어가요)
@@ -70,11 +71,11 @@ function safeEq(a, b) {
 }
 function adminState(me) {
   const list = [];
-  for (const c of clients) list.push({ i: c.id, n: String((c.p && c.p.n) || '').slice(0, 12), me: c === me, adm: !!c.admin });
-  return JSON.stringify({ t: 'a', list, closed: serverClosed, bans: banned.size, waiting: waiting.size });
+  for (const c of clients) list.push({ i: c.id, n: String((c.p && c.p.n) || '').slice(0, 12), me: c === me, adm: !!c.admin, sub: !!c.sub });
+  return JSON.stringify({ t: 'a', role: me && me.admin ? 'admin' : 'sub', list, closed: serverClosed, bans: banned.size, waiting: waiting.size });
 }
 function pushAdminState() {
-  for (const c of [...clients, ...waiting]) if (c.admin) sendText(c, adminState(c));
+  for (const c of [...clients, ...waiting]) if (c.admin || c.sub) sendText(c, adminState(c));
 }
 function kick(c, reason, ban) {
   if (ban) banned.add(c.ip);
@@ -86,19 +87,22 @@ function doAuth(c, m) {
   const rec = authFails.get(c.ip) || { n: 0, t: now };
   if (now - rec.t > 10 * 60 * 1000) { rec.n = 0; rec.t = now; }
   if (rec.n >= 8) { sendText(c, JSON.stringify({ t: 'a', err: 'locked' })); return; }
-  if (!ADMIN_PASS) { sendText(c, JSON.stringify({ t: 'a', err: 'nopass' })); return; }
-  if (!safeEq(String(m.pw || '').slice(0, 200), ADMIN_PASS)) {
+  if (!ADMIN_PASS && !SUB_PASS) { sendText(c, JSON.stringify({ t: 'a', err: 'nopass' })); return; }
+  const pw = String(m.pw || '').slice(0, 200);
+  const isAdm = !!ADMIN_PASS && safeEq(pw, ADMIN_PASS), isSub = !isAdm && !!SUB_PASS && safeEq(pw, SUB_PASS);
+  if (!isAdm && !isSub) {
     rec.n++; authFails.set(c.ip, rec);
     sendText(c, JSON.stringify({ t: 'a', err: 'bad' })); return;
   }
-  c.admin = true;
+  if (isAdm) { c.admin = true; c.sub = false; } else if (!c.admin) c.sub = true;
   sendText(c, adminState(c));
 }
 function doAdmin(c, m) {
-  if (!c.admin) return;
+  if (!c.admin && !c.sub) return;
   const cmd = m.cmd;
+  if (!c.admin && cmd !== 'kick' && cmd !== 'list') return;
   if (cmd === 'kick') {
-    for (const t of clients) if (t.id === m.id && t !== c) { kick(t, m.ban ? 'ban' : 'kick', !!m.ban); break; }
+    for (const t of clients) if (t.id === m.id && t !== c && !t.admin && !(t.sub && !c.admin)) { kick(t, m.ban ? 'ban' : 'kick', !!m.ban); break; }
   } else if (cmd === 'close') {
     serverClosed = true;
     for (const t of [...clients]) if (!t.admin) kick(t, 'closed', false);
