@@ -107,6 +107,8 @@ function doAdmin(c, m) {
     for (const t of [...waiting]) { sendText(t, JSON.stringify({ t: 'opened' })); }
   } else if (cmd === 'unban') {
     banned.clear();
+  } else if (cmd === 'resetlv') {
+    const msg = JSON.stringify({ t: 'notice', text: '모든 플레이어의 레벨이 초기화됐어요', reset: 1 }); for (const t of clients) sendText(t, msg);
   } else if (cmd === 'say') {
     const text = String(m.text || '').replace(/\s+/g, ' ').trim().slice(0, 100);
     if (text) { const msg = JSON.stringify({ t: 'notice', text }); for (const t of clients) sendText(t, msg); }
